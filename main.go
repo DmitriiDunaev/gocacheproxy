@@ -55,6 +55,14 @@ const (
 	// hashSize is the length in bytes of the action/output IDs (SHA-256). The
 	// on-disk index format depends on this being exactly 32.
 	hashSize = 32
+
+	// dropEnv is the environment variable used as the default for -drop.
+	dropEnv = "GOCACHEPROXY_DROP"
+
+	// defaultDropMarkers lists the substrings that identify single-use generator
+	// bootstrap artifacts. Puts whose payload contains any of them are dropped
+	// instead of cached. Override with -drop or the GOCACHEPROXY_DROP env var.
+	defaultDropMarkers = "easyjson-bootstrap,config-bootstrap"
 )
 
 var errNoCacheDir = errors.New("no cache dir (set -cache or GOCACHE)")
@@ -86,11 +94,12 @@ type entry struct {
 }
 
 type proxy struct {
-	cacheDir string
-	tmpDir   string
-	dec      *json.Decoder
-	enc      *json.Encoder
-	out      *bufio.Writer
+	cacheDir    string
+	tmpDir      string
+	dropMarkers [][]byte
+	dec         *json.Decoder
+	enc         *json.Encoder
+	out         *bufio.Writer
 }
 
 func main() {
@@ -100,16 +109,50 @@ func main() {
 		"underlying go build cache dir to read from",
 	)
 
+	drop := flag.String(
+		"drop",
+		dropDefault(),
+		"comma-separated substrings; puts whose payload contains any of them are "+
+			"dropped instead of cached (set to empty to cache everything)",
+	)
+
 	flag.Parse()
 
-	err := run(*cacheDir)
+	err := run(*cacheDir, *drop)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gocacheproxy: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(cacheDir string) error {
+// dropDefault returns the default value for -drop: the GOCACHEPROXY_DROP env var
+// when set, otherwise the built-in bootstrap markers.
+func dropDefault() string {
+	v := os.Getenv(dropEnv)
+	if v != "" {
+		return v
+	}
+
+	return defaultDropMarkers
+}
+
+// parseMarkers splits a comma-separated list into trimmed, non-empty byte
+// substrings used to detect droppable payloads.
+func parseMarkers(s string) [][]byte {
+	parts := strings.Split(s, ",")
+	markers := make([][]byte, 0, len(parts))
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			markers = append(markers, []byte(part))
+		}
+	}
+
+	return markers
+}
+
+func run(cacheDir, drop string) error {
 	if cacheDir == "" {
 		return errNoCacheDir
 	}
@@ -123,11 +166,12 @@ func run(cacheDir string) error {
 
 	out := bufio.NewWriter(os.Stdout)
 	p := &proxy{
-		cacheDir: cacheDir,
-		tmpDir:   tmpDir,
-		dec:      json.NewDecoder(bufio.NewReader(os.Stdin)),
-		enc:      json.NewEncoder(out),
-		out:      out,
+		cacheDir:    cacheDir,
+		tmpDir:      tmpDir,
+		dropMarkers: parseMarkers(drop),
+		dec:         json.NewDecoder(bufio.NewReader(os.Stdin)),
+		enc:         json.NewEncoder(out),
+		out:         out,
 	}
 
 	return p.serve()
@@ -200,7 +244,7 @@ func (p *proxy) handlePut(req *request) *response {
 		return &response{ID: req.ID, Err: err.Error()}
 	}
 
-	if validID(req.ActionID) && validID(req.OutputID) && !isBootstrap(body) {
+	if validID(req.ActionID) && validID(req.OutputID) && !p.shouldDrop(body) {
 		path, werr := p.writeThrough(req.ActionID, req.OutputID, body)
 		if werr != nil {
 			return &response{ID: req.ID, Err: werr.Error()}
@@ -341,12 +385,18 @@ func validID(id []byte) bool {
 	return len(id) == hashSize
 }
 
-// isBootstrap reports whether a put payload is a generator bootstrap artifact.
-// Such artifacts are unique on every run (their cache key is never hit again),
-// so writing them through would only bloat the cache.
-func isBootstrap(body []byte) bool {
-	return bytes.Contains(body, []byte("easyjson-bootstrap")) ||
-		bytes.Contains(body, []byte("config-bootstrap"))
+// shouldDrop reports whether a put payload matches any configured drop marker.
+// Matching payloads are generator bootstrap artifacts that are unique on every
+// run (their cache key is never hit again), so writing them through would only
+// bloat the cache.
+func (p *proxy) shouldDrop(body []byte) bool {
+	for _, m := range p.dropMarkers {
+		if bytes.Contains(body, m) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // writeObject writes a cache object, skipping the write when an identical one is

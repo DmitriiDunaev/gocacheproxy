@@ -37,6 +37,9 @@ It implements the `GOCACHEPROG` JSON protocol over stdin/stdout:
   never enter the real cache.
 - **`close`.** Removes the temporary directory and exits.
 
+The drop markers are configurable, so adding a new generator never requires a
+code change.
+
 Writes are atomic (temp file + rename) and content-addressed, so it is safe to
 run multiple builds against the same cache in parallel.
 
@@ -56,6 +59,23 @@ GOCACHEPROG="gocacheproxy -cache=$(go env GOCACHE)" go generate ./...
 
 If `-cache` is omitted, the proxy falls back to the `GOCACHE` environment
 variable.
+
+### Configuring what gets dropped
+
+Which payloads are dropped (instead of cached) is controlled by a comma-separated
+list of substrings, defaulting to `easyjson-bootstrap,config-bootstrap`. Override
+it with the `-drop` flag or the `GOCACHEPROXY_DROP` environment variable:
+
+```sh
+# add a marker for another generator
+GOCACHEPROG="gocacheproxy -drop=easyjson-bootstrap,config-bootstrap,mygen-bootstrap" go generate ./...
+
+# or via env (handy when GOCACHEPROG can't take args, e.g. docker -e)
+GOCACHEPROXY_DROP="easyjson-bootstrap,config-bootstrap" GOCACHEPROG="gocacheproxy" go generate ./...
+
+# set to empty to cache everything (plain write-through, no dropping)
+GOCACHEPROG="gocacheproxy -drop=" go generate ./...
+```
 
 ## License
 

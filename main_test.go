@@ -119,6 +119,23 @@ func TestProxy(t *testing.T) {
 	assertDrop(t, resps[5], tmpDir, bootOut, bootBody)
 }
 
+func TestParseMarkers(t *testing.T) {
+	t.Parallel()
+
+	got := parseMarkers(" easyjson-bootstrap , ,config-bootstrap,")
+	if len(got) != 2 {
+		t.Fatalf("parseMarkers: got %d markers, want 2: %q", len(got), got)
+	}
+
+	if string(got[0]) != "easyjson-bootstrap" || string(got[1]) != "config-bootstrap" {
+		t.Fatalf("parseMarkers: got %q", got)
+	}
+
+	if len(parseMarkers("")) != 0 {
+		t.Fatal("parseMarkers: empty input should yield no markers")
+	}
+}
+
 func runProxy(t *testing.T, cacheDir, tmpDir string, input []byte, n int) []response {
 	t.Helper()
 
@@ -126,11 +143,12 @@ func runProxy(t *testing.T, cacheDir, tmpDir string, input []byte, n int) []resp
 
 	bw := bufio.NewWriter(&outBuf)
 	p := &proxy{
-		cacheDir: cacheDir,
-		tmpDir:   tmpDir,
-		dec:      json.NewDecoder(bytes.NewReader(input)),
-		enc:      json.NewEncoder(bw),
-		out:      bw,
+		cacheDir:    cacheDir,
+		tmpDir:      tmpDir,
+		dropMarkers: parseMarkers(defaultDropMarkers),
+		dec:         json.NewDecoder(bytes.NewReader(input)),
+		enc:         json.NewEncoder(bw),
+		out:         bw,
 	}
 
 	err := p.serve()
