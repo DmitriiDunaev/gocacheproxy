@@ -1,38 +1,44 @@
 # gocacheproxy
 
-A tiny [`GOCACHEPROG`](https://pkg.go.dev/cmd/go/internal/cacheprog) helper that
-makes the Go build cache **read-through but write-blocked**: it serves cache
-reads from an existing on-disk cache, and silently drops every write so the real
-cache never grows.
+A tiny [`GOCACHEPROG`](https://pkg.go.dev/cmd/go/internal/cacheprog) helper for
+`go generate` that keeps the Go build cache **fast** while stopping generators
+from **polluting** it: it behaves as a normal write-through cache, except it
+drops the single-use *bootstrap* artifacts that generators produce on every run.
 
 ## Why
 
-Some code generators run a throwaway *bootstrap* program via `go run` as part of
-`go generate` — for example [easyjson](https://github.com/mailru/easyjson). Each
-bootstrap is written to a file with a random name, so its compiled output gets a
-brand-new cache key on **every** run and is
-never reused. Over many `go generate` runs these single-use entries pile up and
-bloat `GOCACHE`, even though nothing in your code changed.
+Some code generators build a throwaway *bootstrap* program as part of
+`go generate` — for example [easyjson](https://github.com/mailru/easyjson) and
+[go-4devs/config](https://gitoa.ru/go-4devs/config). Each bootstrap is written
+to a file with a unique temporary name, so its compiled object and linked binary
+get a brand-new cache key on **every** run and are never hit again. Over many
+runs these single-use entries pile up and bloat `GOCACHE` (easily 1000+ entries
+and ~1 GB per `go generate ./...`), even though nothing in your code changed.
 
-`gocacheproxy` lets you keep the speed benefit of the shared cache during
-generation (dependencies are read from it and reused) while preventing the
-generators from polluting it.
+A naive "block all writes" proxy fixes the bloat but is catastrophically slow:
+during `go generate ./...` hundreds of generator processes can no longer reuse
+each other's compiled dependencies, so everything is recompiled from scratch
+over and over (observed: ~3 min → ~27 min).
+
+`gocacheproxy` keeps full caching speed and only discards the junk.
 
 ## How it works
 
 It implements the `GOCACHEPROG` JSON protocol over stdin/stdout:
 
 - **`get` — read-through.** Looks the action up in the underlying on-disk cache
-  and returns the existing object's `DiskPath`. Dependencies stay cached, so
-  compilation stays fast.
-- **`put` — write-blocked.** The produced object is written to a per-process
-  temporary directory (the protocol requires a real `DiskPath` because the
-  current build links against it) and discarded when the proxy exits. Nothing is
-  ever written into the real cache.
+  and returns the existing object's `DiskPath`.
+- **`put` — write-through, except bootstrap junk.** Reusable outputs are written
+  into the real cache using the exact same on-disk layout as the go command (an
+  `-a` index entry plus the `-d` object), so they are reused for the rest of the
+  run and on later runs. Outputs whose payload is a generator bootstrap artifact
+  (detected by the embedded `easyjson-bootstrap` / `config-bootstrap` temp path)
+  are written to a per-process temporary directory and discarded on exit, so they
+  never enter the real cache.
 - **`close`.** Removes the temporary directory and exits.
 
-Because each invocation uses its own `os.MkdirTemp` directory and only reads
-(never writes) shared cache files, it is safe to run multiple builds in parallel.
+Writes are atomic (temp file + rename) and content-addressed, so it is safe to
+run multiple builds against the same cache in parallel.
 
 ## Install
 
@@ -42,7 +48,7 @@ go install github.com/dmitriidunaev/gocacheproxy@latest
 
 ## Usage
 
-Set `GOCACHEPROG` only for the command whose writes you want to discard:
+Set `GOCACHEPROG` only for the command whose bootstrap junk you want to discard:
 
 ```sh
 GOCACHEPROG="gocacheproxy -cache=$(go env GOCACHE)" go generate ./...

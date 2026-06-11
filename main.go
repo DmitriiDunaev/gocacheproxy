@@ -1,12 +1,19 @@
-// Command gocacheproxy is a GOCACHEPROG helper that serves cache reads from an
-// existing on-disk Go build cache but never writes anything back into it.
+// Command gocacheproxy is a GOCACHEPROG helper for code generation (go generate)
+// that keeps the shared Go build cache fast while preventing it from being
+// polluted by generators.
 //
-// It is meant to be used only for code generation (go generate), where the
-// bootstrap programs of generators such as easyjson keep polluting the shared
-// GOCACHE with single-use entries. With this proxy, "get" requests are answered
-// from the real cache (so dependencies are reused and compilation stays fast),
-// while "put" requests are written to a throwaway temporary directory and
-// discarded on exit, so the real cache never grows.
+// Generators such as easyjson and gitoa.ru/go-4devs/config build a throwaway
+// "bootstrap" program on every run. Each bootstrap has a unique temporary name,
+// so its compiled object and linked binary get a unique cache key that is never
+// hit again — they only accumulate as dead weight (well over a thousand entries
+// per `go generate ./...`).
+//
+// This proxy works as a write-through cache with one exception: "get" requests
+// are answered from the real cache, every "put" is written through to the real
+// cache so dependencies are cached and reused across the whole run (and across
+// runs), EXCEPT puts whose payload is bootstrap junk, which are written to a
+// throwaway temp dir and discarded on exit. Reusable work stays cached; the
+// per-run junk never lands in the cache.
 //
 // The JSON wire protocol and struct field names are dictated by the go command
 // (see cmd/go/internal/cacheprog), so the JSON tags below intentionally use the
@@ -15,6 +22,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -37,8 +45,16 @@ const (
 	// shard entries into subdirectories (e.g. "ab/abcd...-a").
 	cacheSubdirLen = 2
 
-	// outputFileMode is the permission for the throwaway "put" object files.
+	// outputFileMode is the permission for cache object files written by this
+	// proxy (matching the go command's owner-writable default after umask).
 	outputFileMode = 0o600
+
+	// cacheDirMode is the permission for cache shard directories.
+	cacheDirMode = 0o755
+
+	// hashSize is the length in bytes of the action/output IDs (SHA-256). The
+	// on-disk index format depends on this being exactly 32.
+	hashSize = 32
 )
 
 var errNoCacheDir = errors.New("no cache dir (set -cache or GOCACHE)")
@@ -184,14 +200,62 @@ func (p *proxy) handlePut(req *request) *response {
 		return &response{ID: req.ID, Err: err.Error()}
 	}
 
+	if validID(req.ActionID) && validID(req.OutputID) && !isBootstrap(body) {
+		path, werr := p.writeThrough(req.ActionID, req.OutputID, body)
+		if werr != nil {
+			return &response{ID: req.ID, Err: werr.Error()}
+		}
+
+		return &response{ID: req.ID, DiskPath: path}
+	}
+
+	return p.drop(req, body)
+}
+
+// drop writes a put payload to the throwaway temp dir instead of the real cache.
+// It is used for bootstrap junk (unique every run, never reused) so it never
+// pollutes the shared cache, while still giving the go command a DiskPath to use
+// for the current build.
+func (p *proxy) drop(req *request, body []byte) *response {
 	path := filepath.Join(p.tmpDir, hex.EncodeToString(req.OutputID)+"-d")
 
-	err = os.WriteFile(path, body, outputFileMode)
+	err := os.WriteFile(path, body, outputFileMode)
 	if err != nil {
 		return &response{ID: req.ID, Err: err.Error()}
 	}
 
 	return &response{ID: req.ID, DiskPath: path}
+}
+
+// writeThrough stores an output and its index entry in the real cache using the
+// same on-disk layout as the go command, then returns the path to the object so
+// the entry can be found by subsequent get requests (from this or any other
+// proxy instance sharing the cache).
+func (p *proxy) writeThrough(actionID, outputID, body []byte) (string, error) {
+	outHex := hex.EncodeToString(outputID)
+
+	outPath := filepath.Join(p.cacheDir, outHex[:cacheSubdirLen], outHex+"-d")
+
+	err := writeObject(outPath, body)
+	if err != nil {
+		return "", err
+	}
+
+	actHex := hex.EncodeToString(actionID)
+
+	actPath := filepath.Join(p.cacheDir, actHex[:cacheSubdirLen], actHex+"-a")
+
+	line := fmt.Sprintf(
+		"v1 %x %x %20d %20d\n",
+		actionID, outputID, len(body), time.Now().UnixNano(),
+	)
+
+	err = writeFileAtomic(actPath, []byte(line))
+	if err != nil {
+		return "", err
+	}
+
+	return outPath, nil
 }
 
 func (p *proxy) readBody(size int64) ([]byte, error) {
@@ -265,6 +329,90 @@ func (p *proxy) write(resp *response) error {
 	err = p.out.Flush()
 	if err != nil {
 		return fmt.Errorf("flush response: %w", err)
+	}
+
+	return nil
+}
+
+// validID reports whether id has the exact length the on-disk index format
+// requires. Malformed ids are never written through, to avoid corrupting the
+// cache index.
+func validID(id []byte) bool {
+	return len(id) == hashSize
+}
+
+// isBootstrap reports whether a put payload is a generator bootstrap artifact.
+// Such artifacts are unique on every run (their cache key is never hit again),
+// so writing them through would only bloat the cache.
+func isBootstrap(body []byte) bool {
+	return bytes.Contains(body, []byte("easyjson-bootstrap")) ||
+		bytes.Contains(body, []byte("config-bootstrap"))
+}
+
+// writeObject writes a cache object, skipping the write when an identical one is
+// already present (cache objects are content-addressed, so equal size means
+// equal content).
+func writeObject(path string, body []byte) error {
+	info, err := os.Stat(path)
+	if err == nil && info.Size() == int64(len(body)) {
+		return nil
+	}
+
+	return writeFileAtomic(path, body)
+}
+
+// writeFileAtomic writes data to path via a temp file and rename, so concurrent
+// proxy instances sharing the cache never observe a partially written file.
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+
+	err := os.MkdirAll(dir, cacheDirMode)
+	if err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+
+	f, err := os.CreateTemp(dir, ".gocacheproxy-*")
+	if err != nil {
+		return fmt.Errorf("create temp in %s: %w", dir, err)
+	}
+
+	tmp := f.Name()
+
+	err = writeAndClose(f, data)
+	if err != nil {
+		_ = os.Remove(tmp)
+
+		return err
+	}
+
+	err = os.Chmod(tmp, outputFileMode)
+	if err != nil {
+		_ = os.Remove(tmp)
+
+		return fmt.Errorf("chmod %s: %w", tmp, err)
+	}
+
+	err = os.Rename(tmp, path)
+	if err != nil {
+		_ = os.Remove(tmp)
+
+		return fmt.Errorf("rename %s: %w", tmp, err)
+	}
+
+	return nil
+}
+
+func writeAndClose(f *os.File, data []byte) error {
+	_, err := f.Write(data)
+	if err != nil {
+		_ = f.Close()
+
+		return fmt.Errorf("write %s: %w", f.Name(), err)
+	}
+
+	err = f.Close()
+	if err != nil {
+		return fmt.Errorf("close %s: %w", f.Name(), err)
 	}
 
 	return nil
